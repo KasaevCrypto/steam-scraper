@@ -6,10 +6,14 @@ on:
         description: "Сколько серверов запустить одновременно (1-20)"
         default: "10"
       endpoint:
-        description: "Что тестируем"
+        description: "Что тестируем (через Worker работает только histogram)"
         type: choice
         options: [histogram, search]
         default: histogram
+      via_worker:
+        description: "Идти через Cloudflare Worker (иначе напрямую из GitHub)"
+        type: boolean
+        default: true
       intervals:
         description: "Пауза между запросами на ОДИН сервер по ступеням, сек (общий темп = серверов / пауза)"
         default: "4,3,2,1.5,1,0.7,0.5"
@@ -54,11 +58,18 @@ jobs:
           ENDPOINT: ${{ inputs.endpoint }}
           INTERVALS: ${{ inputs.intervals }}
           STAGE_LEN: ${{ inputs.stage_len }}
+          VIA_WORKER: ${{ inputs.via_worker }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: |
+          EXTRA=()
+          if [ "$VIA_WORKER" = "true" ]; then
+            EXTRA=(--via-worker "$WORKER_URL")
+          fi
           python speedtest.py probe \
             --job "${{ matrix.job }}" --jobs "$N" --start "$START" \
             --endpoint "$ENDPOINT" --intervals "$INTERVALS" \
-            --stage-len "$STAGE_LEN" --ids Rust.json
+            --stage-len "$STAGE_LEN" --ids Rust.json "${EXTRA[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
