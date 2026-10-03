@@ -1,13 +1,35 @@
-name: Steam probe
+name: Steam probe 2
 on: workflow_dispatch
 jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Ping Steam
+      - name: Probe full chain
         run: |
-          curl -s -o out.json -w "HTTP %{http_code}\n" \
-            -A "Mozilla/5.0" \
-            "https://steamcommunity.com/market/search/render/?query=&start=0&count=10&appid=252490&norender=1"
-          head -c 400 out.json
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          S="https://steamcommunity.com/market"
+
+          echo "--- 1. поиск, count=100, UA python-requests"
+          curl -s -o p1.json -w "HTTP %{http_code}\n" -A "python-requests/2.31" \
+            "$S/search/render/?query=&start=0&count=100&appid=252490&norender=1"
+          head -c 120 p1.json; echo
+
+          sleep 2
+          echo "--- 2. поиск, count=100, браузерный UA"
+          curl -s -o p2.json -w "HTTP %{http_code}\n" -A "$UA" \
+            "$S/search/render/?query=&start=0&count=100&appid=252490&norender=1"
+          python3 -c "import json;d=json.load(open('p2.json'));print('results:',len(d.get('results',[])))" || head -c 200 p2.json
+
+          sleep 3
+          echo "--- 3. страница предмета"
+          curl -s -o item.html -w "HTTP %{http_code}\n" -A "$UA" \
+            "$S/listings/252490/Neon%20Small%20Fuel%20Storage"
+          ID=$(grep -oP 'Market_LoadOrderSpread\(\s*\K\d+' item.html | head -1)
+          echo "nameid=$ID"
+
+          sleep 3
+          echo "--- 4. histogram"
+          curl -s -o h.json -w "HTTP %{http_code}\n" -A "$UA" \
+            "$S/itemordershistogram?country=KZ&language=russian&currency=37&item_nameid=$ID&two_factor=0"
+          head -c 300 h.json; echo
