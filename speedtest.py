@@ -8,6 +8,10 @@
   report  - собирает все jsonl и печатает сводку по ступеням: сколько запросов
             в секунду шло суммарно и с какой ступени начались 429.
 
+Режим --via-worker URL: запросы идут не в Steam напрямую, а через приватный
+Cloudflare Worker (токен в переменной окружения WORKER_TOKEN). Статусы Worker/Cloudflare
+пишутся отдельно (1000 + код), чтобы не путать их с 429 от Steam.
+
 Сервер останавливается сам после --stop-after неудачных запросов подряд,
 чтобы не долбить Steam, когда блок уже случился.
 """
@@ -66,6 +70,13 @@ def cmd_probe(a):
     if not pool:
         sys.exit("пустой пул идентификаторов")
 
+    worker_url = a.via_worker or ""
+    token = os.environ.get("WORKER_TOKEN", "")
+    if worker_url and a.endpoint != "histogram":
+        sys.exit("--via-worker поддерживает только --endpoint histogram")
+    if worker_url and not a.dry_run and not token:
+        sys.exit("для --via-worker нужна переменная окружения WORKER_TOKEN")
+
     sess = None
     if not a.dry_run:
         sess = requests.Session()
@@ -75,8 +86,9 @@ def cmd_probe(a):
             "Accept-Language": "ru,en;q=0.8",
         })
         sess.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=a.workers))
+        sess.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=a.workers))
 
-    print(f"[job {a.job}] ip={ip} pool={len(pool)} stages={intervals} "
+    print(f"[job {a.job}] ip={ip} via={'worker' if worker_url else 'direct'} pool={len(pool)} stages={intervals} "
           f"stage_len={a.stage_len}s start_in={a.start - time.time():.0f}s", flush=True)
 
     lock = threading.Lock()
@@ -87,14 +99,29 @@ def cmd_probe(a):
     def do_req(ident, stage, interval):
         t0 = time.time()
         ra = None
+        colo = None
         if a.dry_run:
             time.sleep(random.uniform(0.05, 0.2))
             st = 429 if (stage >= 1 and random.random() < 0.3) else 200
+            colo = "DRY" if worker_url else None
         else:
             try:
-                r = sess.get(build_url(a.endpoint, ident), timeout=20)
-                st = r.status_code
-                ra = r.headers.get("Retry-After")
+                if worker_url:
+                    r = sess.get(worker_url, params={"id": ident},
+                                 headers={"X-Token": token}, timeout=25)
+                    colo = r.headers.get("X-Colo")
+                    steam = r.headers.get("X-Steam-Status")
+                    if steam is None:
+                        # ответ не из кода Worker: 401/400 от него самого или лимит/ошибка Cloudflare
+                        st = 1000 + r.status_code
+                        ra = r.headers.get("Retry-After")
+                    else:
+                        st = int(steam)
+                        ra = r.headers.get("X-Steam-RA")
+                else:
+                    r = sess.get(build_url(a.endpoint, ident), timeout=20)
+                    st = r.status_code
+                    ra = r.headers.get("Retry-After")
                 if st == 200:
                     try:
                         body = r.json()
@@ -111,7 +138,8 @@ def cmd_probe(a):
             rows.append({"job": a.job, "ip": ip, "t": round(t0, 3),
                          "rel": round(t0 - a.start, 3), "stage": stage,
                          "interval": interval, "status": st,
-                         "lat": round(lat, 3), "ra": ra})
+                         "lat": round(lat, 3), "ra": ra, "colo": colo,
+                         "via": "worker" if worker_url else "direct"})
             counts[st] += 1
             if st == 200:
                 state["bad_run"] = 0
@@ -187,8 +215,17 @@ def cmd_report(a):
         out.append(f"IP, общие для нескольких серверов: {shared}")
     out.append("")
 
-    out.append("| Ступень | Пауза/сервер, с | Серверов | Запросов | Общий темп, зап/с | 200 | 429 | прочее | p50 lat, с | p95 lat, с |")
-    out.append("|---|---|---|---|---|---|---|---|---|---|")
+    via_worker = any(r.get("via") == "worker" for r in rows)
+    if via_worker:
+        out.append("Режим: **через Cloudflare Worker**. IP выше это раннеры GitHub; Steam видит адреса Cloudflare.")
+        colos = defaultdict(Counter)
+        for r in rows:
+            colos[r["job"]][r.get("colo") or "?"] += 1
+        out.append("Дата-центры Cloudflare по серверам: " +
+                   ", ".join(f"{j}: {'/'.join(sorted(c))}" for j, c in sorted(colos.items())))
+        out.append("")
+    out.append("| Ступень | Пауза/сервер, с | Серверов | Запросов | Общий темп, зап/с | 200 | 429 | Worker/CF | прочее | p50 lat, с | p95 lat, с |")
+    out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     first_bad_stage = None
     stage_summary = []
     for stage, interval in intervals:
@@ -196,7 +233,8 @@ def cmd_report(a):
         n = len(rs)
         c = Counter(r["status"] for r in rs)
         n200, n429 = c.get(200, 0), c.get(429, 0)
-        other = n - n200 - n429
+        nworker = sum(v for k, v in c.items() if k >= 1000)
+        other = n - n200 - n429 - nworker
         active = len({r["job"] for r in rs})
         rel = [r["rel"] for r in rs]
         span = max(a.stage_len, 1) if rel else 1
@@ -206,9 +244,10 @@ def cmd_report(a):
         if bad_share > 0.01 and first_bad_stage is None:
             first_bad_stage = stage
         stage_summary.append({"stage": stage, "interval": interval, "jobs": active, "sent": n,
-                              "rps": round(rps, 2), "ok": n200, "r429": n429, "other": other})
+                              "rps": round(rps, 2), "ok": n200, "r429": n429,
+                              "worker": nworker, "other": other})
         out.append(f"| {stage} | {interval} | {active} | {n} | {rps:.1f} | {n200} | {n429} | "
-                   f"{other} | {pct(lat, .5):.2f} | {pct(lat, .95):.2f} |")
+                   f"{nworker} | {other} | {pct(lat, .5):.2f} | {pct(lat, .95):.2f} |")
     out.append("")
 
     bad = [r for r in rows if r["status"] in (429, 403)]
@@ -233,6 +272,13 @@ def cmd_report(a):
     else:
         out.append("429/403 не было ни на одной ступени: потолок выше самой быстрой ступени, "
                    "добавьте более короткие паузы в intervals.")
+
+    wbad = [r for r in rows if r["status"] >= 1000]
+    if wbad:
+        wc = Counter(r["status"] - 1000 for r in wbad)
+        out.append(f"\nОшибки самого Worker/Cloudflare (не Steam): {dict(wc)}, "
+                   f"первая через {wbad[0]['rel']:.0f} с, ступень {wbad[0]['stage']}. "
+                   f"1401=неверный токен, 1400=плохой id, 1429/1015=лимит Cloudflare.")
 
     if first_bad_stage is not None:
         prev = [s for s in stage_summary if s["stage"] < first_bad_stage]
@@ -268,6 +314,8 @@ def main():
     pp.add_argument("--stage-len", dest="stage_len", type=float, default=60)
     pp.add_argument("--stop-after", dest="stop_after", type=int, default=5)
     pp.add_argument("--workers", type=int, default=24)
+    pp.add_argument("--via-worker", dest="via_worker", default="",
+                    help="URL Cloudflare Worker; токен берётся из переменной WORKER_TOKEN")
     pp.add_argument("--dry-run", dest="dry_run", action="store_true")
     pp.set_defaults(fn=cmd_probe)
 
