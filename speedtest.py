@@ -243,7 +243,7 @@ def cmd_report(a):
         other = n - n200 - n429 - nworker
         active = len({r["job"] for r in rs})
         rel = [r["rel"] for r in rs]
-        span = max(a.stage_len, 1) if rel else 1
+        span = max(1.0, max(rel) - min(rel)) if rel else 1  # реальная длительность, а не плановая
         rps = n / span
         lat = [r["lat"] for r in rs]
         bad_share = (n - n200) / n if n else 0
@@ -268,6 +268,14 @@ def cmd_report(a):
         ra = [r["ra"] for r in bad if r.get("ra")]
         if ra:
             out.append(f"Заголовок Retry-After встречался: {Counter(ra).most_common(3)}")
+        good_before = sum(1 for r in rows if r["t"] < b["t"] and r["status"] == 200)
+        out.append(f"Успешных запросов до первого блока (все серверы): **{good_before}**.")
+        rec = [r for r in rows if r["t"] > b["t"] and r["status"] == 200]
+        if rec:
+            out.append(f"Первый 200 после блока: через **{rec[0]['rel'] - b['rel']:.0f} с** после первого 429 "
+                       f"({rec[0]['rel']:.0f} с от старта).")
+        else:
+            out.append("После первого блока ни одного 200 до конца теста: блок не снялся за время наблюдения.")
         firsts = defaultdict(float)
         for r in bad:
             firsts.setdefault(r["job"], r["rel"])
