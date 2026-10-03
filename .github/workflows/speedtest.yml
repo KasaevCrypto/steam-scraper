@@ -20,6 +20,9 @@ on:
       stage_len:
         description: "Длина одной ступени, сек"
         default: "60"
+      stop_after:
+        description: "Остановить сервер после стольких неудач подряд (5 = обычный тест; 1000 = ждать конца блока)"
+        default: "5"
 
 jobs:
   prepare:
@@ -59,6 +62,7 @@ jobs:
           INTERVALS: ${{ inputs.intervals }}
           STAGE_LEN: ${{ inputs.stage_len }}
           VIA_WORKER: ${{ inputs.via_worker }}
+          STOP_AFTER: ${{ inputs.stop_after }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: |
@@ -69,7 +73,7 @@ jobs:
           python speedtest.py probe \
             --job "${{ matrix.job }}" --jobs "$N" --start "$START" \
             --endpoint "$ENDPOINT" --intervals "$INTERVALS" \
-            --stage-len "$STAGE_LEN" --ids Rust.json "${EXTRA[@]}"
+            --stage-len "$STAGE_LEN" --stop-after "$STOP_AFTER" --ids Rust.json "${EXTRA[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
