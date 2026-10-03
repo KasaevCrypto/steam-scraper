@@ -1,0 +1,94 @@
+name: Steam fast scrape
+on:
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: "Сколько серверов (1-20)"
+        default: "20"
+      interval:
+        description: "Пауза между запросами на ОДИН сервер, сек (общий темп = серверов / пауза)"
+        default: "1.0"
+      ids_file:
+        description: "Файл «название -> item_nameid»"
+        default: "Rust.json"
+  # Для запуска по расписанию уберите # в двух строках ниже (раз в час):
+  # schedule:
+  #   - cron: "7 * * * *"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      chunks: ${{ steps.m.outputs.chunks }}
+      interval: ${{ steps.m.outputs.interval }}
+      ids_file: ${{ steps.m.outputs.ids_file }}
+    steps:
+      - id: m
+        env:
+          CHUNKS: ${{ inputs.chunks || '20' }}
+          INTERVAL: ${{ inputs.interval || '1.0' }}
+          IDS_FILE: ${{ inputs.ids_file || 'Rust.json' }}
+        run: |
+          echo "matrix=$(python3 -c "import json,os;print(json.dumps(list(range(int(os.environ['CHUNKS'])))))")" >> "$GITHUB_OUTPUT"
+          echo "chunks=$CHUNKS" >> "$GITHUB_OUTPUT"
+          echo "interval=$INTERVAL" >> "$GITHUB_OUTPUT"
+          echo "ids_file=$IDS_FILE" >> "$GITHUB_OUTPUT"
+
+  scrape:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install requests
+      - name: Scrape
+        env:
+          CHUNKS: ${{ needs.prepare.outputs.chunks }}
+          INTERVAL: ${{ needs.prepare.outputs.interval }}
+          IDS_FILE: ${{ needs.prepare.outputs.ids_file }}
+        run: |
+          python fast_scrape.py scrape --chunk "${{ matrix.chunk }}" --chunks "$CHUNKS" \
+            --interval "$INTERVAL" --ids "$IDS_FILE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.chunk }}
+          path: result-${{ matrix.chunk }}.csv
+          if-no-files-found: warn
+
+  merge:
+    needs: [prepare, scrape]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+      - name: Merge
+        env:
+          CHUNKS: ${{ needs.prepare.outputs.chunks }}
+          IDS_FILE: ${{ needs.prepare.outputs.ids_file }}
+        run: |
+          python fast_scrape.py merge --dir results --ids "$IDS_FILE" \
+            --expect "$CHUNKS" --out prices.csv --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FINAL-RUST-PRICES
+          path: prices.csv
+          if-no-files-found: ignore
