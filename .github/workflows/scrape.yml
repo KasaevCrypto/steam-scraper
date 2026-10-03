@@ -1,62 +1,13 @@
-name: Distributed Steam Scraper
-
-on: 
-  workflow_dispatch:
-
+name: Steam probe
+on: workflow_dispatch
 jobs:
-  prepare:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Защита от съедания минут
+    timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.10' }
-      - run: pip install requests
-      - name: Fetch all items list
-        run: python scraper.py --get-names
-      - uses: actions/upload-artifact@v4
-        with:
-          name: items-list
-          path: items.txt
-
-  scrape:
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 50  # Защита: убивать процесс через 50 минут, спасая лимит GitHub
-    strategy:
-      fail-fast: false
-      matrix:
-        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.10' }
-      - run: pip install requests
-      - uses: actions/download-artifact@v4
-        with:
-          name: items-list
-      - name: Scrape my chunk
-        run: python scraper.py --scrape ${{ matrix.chunk }} 20
-      - uses: actions/upload-artifact@v4
-        with:
-          name: result-${{ matrix.chunk }}
-          path: result_${{ matrix.chunk }}.csv
-
-  merge:
-    needs: scrape
-    if: always()  # КРИТИЧЕСКИ ВАЖНО: склеить всё, даже если часть job (scrape) упала
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: result-*
-          merge-multiple: true
-      - name: Merge all CSV files
+      - name: Ping Steam
         run: |
-          echo "Name,BuyOrder" > final_prices.csv
-          # Проверяем, есть ли вообще файлы перед мержем
-          ls result_*.csv >/dev/null 2>&1 && cat result_*.csv | grep -v "Name,BuyOrder" >> final_prices.csv || echo "Не найдено файлов для мержа"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: FINAL-RUST-PRICES
-          path: final_prices.csv
+          curl -s -o out.json -w "HTTP %{http_code}\n" \
+            -A "Mozilla/5.0" \
+            "https://steamcommunity.com/market/search/render/?query=&start=0&count=10&appid=252490&norender=1"
+          head -c 400 out.json
