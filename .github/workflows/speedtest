@@ -1,0 +1,92 @@
+name: Steam speed test
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Сколько серверов запустить одновременно (1-20)"
+        default: "10"
+      endpoint:
+        description: "Что тестируем"
+        type: choice
+        options: [histogram, search]
+        default: histogram
+      intervals:
+        description: "Пауза между запросами на ОДИН сервер по ступеням, сек (общий темп = серверов / пауза)"
+        default: "4,3,2,1.5,1,0.7,0.5"
+      stage_len:
+        description: "Длина одной ступени, сек"
+        default: "60"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      start: ${{ steps.m.outputs.start }}
+    steps:
+      - id: m
+        env:
+          N: ${{ inputs.jobs }}
+        run: |
+          echo "matrix=$(python3 -c "import json,os;print(json.dumps(list(range(int(os.environ['N'])))))")" >> "$GITHUB_OUTPUT"
+          # общий старт через 3 минуты: все серверы успевают подняться и стартуют в одну секунду
+          echo "start=$(( $(date +%s) + 180 ))" >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install requests
+      - name: Probe
+        env:
+          START: ${{ needs.prepare.outputs.start }}
+          N: ${{ inputs.jobs }}
+          ENDPOINT: ${{ inputs.endpoint }}
+          INTERVALS: ${{ inputs.intervals }}
+          STAGE_LEN: ${{ inputs.stage_len }}
+        run: |
+          python speedtest.py probe \
+            --job "${{ matrix.job }}" --jobs "$N" --start "$START" \
+            --endpoint "$ENDPOINT" --intervals "$INTERVALS" \
+            --stage-len "$STAGE_LEN" --ids Rust.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.job }}
+          path: probe-${{ matrix.job }}.jsonl
+          if-no-files-found: warn
+
+  report:
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: probe-*
+          path: results
+      - name: Report
+        env:
+          STAGE_LEN: ${{ inputs.stage_len }}
+        run: |
+          python speedtest.py report --dir results --stage-len "$STAGE_LEN" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speedtest-summary
+          path: speedtest-summary.json
