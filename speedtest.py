@@ -70,8 +70,10 @@ def cmd_probe(a):
     if not pool:
         sys.exit("пустой пул идентификаторов")
 
-    worker_url = a.via_worker or ""
-    token = os.environ.get("WORKER_TOKEN", "")
+    worker_url = (a.via_worker or "").strip()
+    if worker_url and not worker_url.startswith(("http://", "https://")):
+        worker_url = "https://" + worker_url
+    token = os.environ.get("WORKER_TOKEN", "").strip()
     if worker_url and a.endpoint != "histogram":
         sys.exit("--via-worker поддерживает только --endpoint histogram")
     if worker_url and not a.dry_run and not token:
@@ -92,7 +94,7 @@ def cmd_probe(a):
           f"stage_len={a.stage_len}s start_in={a.start - time.time():.0f}s", flush=True)
 
     lock = threading.Lock()
-    state = {"stop": False, "bad_run": 0, "reason": ""}
+    state = {"stop": False, "bad_run": 0, "reason": "", "err": ""}
     rows = []
     counts = Counter()
 
@@ -131,8 +133,12 @@ def cmd_probe(a):
                         good = False
                     if not good:
                         st = 299  # 200, но данных нет
-            except Exception:
+            except Exception as e:
                 st = 0
+                with lock:
+                    if not state["err"]:
+                        state["err"] = f"{type(e).__name__}: {str(e)[:200]}"
+                        print(f"[job {a.job}] ПЕРВАЯ ОШИБКА ЗАПРОСА: {state['err']}", flush=True)
         lat = time.time() - t0
         with lock:
             rows.append({"job": a.job, "ip": ip, "t": round(t0, 3),
