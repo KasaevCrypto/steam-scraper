@@ -1,35 +1,157 @@
-name: Steam probe 2
-on: workflow_dispatch
+name: Steam Rust prices
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: "Сколько параллельных серверов (1-20). Для теста поставьте 2"
+        default: "20"
+        type: string
+      limit:
+        description: "Макс. предметов на сервер (0 = все). Для теста поставьте 5"
+        default: "0"
+        type: string
+      delay:
+        description: "Пауза между запросами, сек"
+        default: "3.5"
+        type: string
+      refresh_names:
+        description: "Заново собрать список предметов (~25 мин)"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steam-scraper
+  cancel-in-progress: false
+
 jobs:
-  probe:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      count: ${{ steps.m.outputs.count }}
     steps:
-      - name: Probe full chain
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Collect item list (only if missing or refresh requested)
+        env:
+          REFRESH: ${{ inputs.refresh_names }}
         run: |
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          S="https://steamcommunity.com/market"
+          if [ ! -f items.json ] || [ "$REFRESH" = "true" ]; then
+            python scraper.py names --deadline-min 40
+          else
+            echo "items.json уже есть в репозитории, пропускаю сбор"
+          fi
+      - name: Build matrix
+        id: m
+        env:
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          python - >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, os
+          try:
+              n = int(os.environ["CHUNKS"])
+          except ValueError:
+              n = 20
+          n = max(1, min(20, n))
+          print("matrix=" + json.dumps(list(range(n))))
+          print("count=" + str(n))
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: items-list
+          path: items.json
+          retention-days: 7
 
-          echo "--- 1. поиск, count=100, UA python-requests"
-          curl -s -o p1.json -w "HTTP %{http_code}\n" -A "python-requests/2.31" \
-            "$S/search/render/?query=&start=0&count=100&appid=252490&norender=1"
-          head -c 120 p1.json; echo
+  scrape:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - uses: actions/download-artifact@v4
+        with:
+          name: items-list
+      - name: Scrape my chunk
+        timeout-minutes: 40
+        env:
+          LIMIT: ${{ inputs.limit }}
+          DELAY: ${{ inputs.delay }}
+        run: >
+          python scraper.py scrape
+          ${{ matrix.chunk }} ${{ needs.prepare.outputs.count }}
+          --limit "$LIMIT" --delay "$DELAY" --deadline-min 35
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.chunk }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 7
 
-          sleep 2
-          echo "--- 2. поиск, count=100, браузерный UA"
-          curl -s -o p2.json -w "HTTP %{http_code}\n" -A "$UA" \
-            "$S/search/render/?query=&start=0&count=100&appid=252490&norender=1"
-          python3 -c "import json;d=json.load(open('p2.json'));print('results:',len(d.get('results',[])))" || head -c 200 p2.json
-
-          sleep 3
-          echo "--- 3. страница предмета"
-          curl -s -o item.html -w "HTTP %{http_code}\n" -A "$UA" \
-            "$S/listings/252490/Neon%20Small%20Fuel%20Storage"
-          ID=$(grep -oP 'Market_LoadOrderSpread\(\s*\K\d+' item.html | head -1)
-          echo "nameid=$ID"
-
-          sleep 3
-          echo "--- 4. histogram"
-          curl -s -o h.json -w "HTTP %{http_code}\n" -A "$UA" \
-            "$S/itemordershistogram?country=KZ&language=russian&currency=37&item_nameid=$ID&two_factor=0"
-          head -c 300 h.json; echo
+  merge:
+    needs: [prepare, scrape]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - uses: actions/download-artifact@v4
+        with:
+          name: items-list
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: parts
+      - name: Merge results
+        run: |
+          mkdir -p parts
+          python scraper.py merge parts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FINAL-RUST-PRICES
+          path: prices.csv
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Save item list and IDs to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for f in items.json ids.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "Кэш не изменился"
+          else
+            git commit -m "Update item cache"
+            git push
+          fi
