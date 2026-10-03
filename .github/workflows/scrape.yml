@@ -6,6 +6,7 @@ on:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Защита от съедания минут
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +22,7 @@ jobs:
   scrape:
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 50  # Защита: убивать процесс через 50 минут, спасая лимит GitHub
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +44,7 @@ jobs:
 
   merge:
     needs: scrape
+    if: always()  # КРИТИЧЕСКИ ВАЖНО: склеить всё, даже если часть job (scrape) упала
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -51,7 +54,8 @@ jobs:
       - name: Merge all CSV files
         run: |
           echo "Name,BuyOrder" > final_prices.csv
-          cat result_*.csv | grep -v "Name,BuyOrder" >> final_prices.csv || true
+          # Проверяем, есть ли вообще файлы перед мержем
+          ls result_*.csv >/dev/null 2>&1 && cat result_*.csv | grep -v "Name,BuyOrder" >> final_prices.csv || echo "Не найдено файлов для мержа"
       - uses: actions/upload-artifact@v4
         with:
           name: FINAL-RUST-PRICES
