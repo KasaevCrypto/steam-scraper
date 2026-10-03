@@ -98,6 +98,35 @@ def load_ids():
     return ids
 
 
+def load_items():
+    """Читает items.json -> (items, legacy_ids).
+    items: {name: is_commodity (bool|None если неизвестно)}
+    Понимает форматы значений: bool (наш), int (старая база {name: item_nameid}),
+    dict ({"item_nameid": .., "is_commodity": ..}).
+    """
+    raw = load_json(ITEMS_FILE, None)
+    if not raw:
+        return None, {}
+    items, ids = {}, {}
+    for name, v in raw.items():
+        if isinstance(v, bool):
+            items[name] = v
+        elif isinstance(v, int):
+            items[name] = None
+            ids[name] = v
+        elif isinstance(v, dict):
+            items[name] = bool(v["is_commodity"]) if "is_commodity" in v else None
+            if v.get("item_nameid"):
+                ids[name] = int(v["item_nameid"])
+        else:
+            items[name] = None
+    return items, ids
+
+
+def comm(v):
+    return "" if v is None else int(v)
+
+
 def fetch(session, url, dl, params=None, tries=5, label=""):
     """GET с повторами. Возвращает (status, response).
     status: ok | rate_limited | network | deadline | http_NNN
@@ -222,14 +251,14 @@ def process_item(s, name, ids, new_ids, a, dl):
 
 def cmd_scrape(a):
     dl = Deadline(a.deadline_min)
-    items = load_json(ITEMS_FILE, None)
+    items, legacy_ids = load_items()
     if not items:
         die(f"{ITEMS_FILE} не найден или пуст")
     names = sorted(items)
     mine = names[a.chunk::a.total]  # через одного: нагрузка ровная
     if a.limit > 0:
         mine = mine[:a.limit]
-    ids = load_ids()
+    ids = {**legacy_ids, **load_ids()}  # ids.json новее старой базы
     new_ids = {}
     log(f"Чанк {a.chunk}/{a.total}: {len(mine)} предметов, известных ID: {len(ids)}")
 
@@ -254,13 +283,13 @@ def cmd_scrape(a):
                 if stop_reason:
                     log(f"Останавливаюсь ({stop_reason}) на {i - 1}/{len(mine)}")
                     for rest in mine[i - 1:]:
-                        w.writerow([rest, int(items[rest]), ids.get(rest, ""), "", "", f"not_processed_{stop_reason}", ""])
+                        w.writerow([rest, comm(items[rest]), ids.get(rest, ""), "", "", f"not_processed_{stop_reason}", ""])
                         stats[f"not_processed_{stop_reason}"] += 1
                     break
 
                 status, nameid, buy, sell = process_item(s, name, ids, new_ids, a, dl)
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                w.writerow([name, int(items[name]), nameid or "", buy, sell, status, ts])
+                w.writerow([name, comm(items[name]), nameid or "", buy, sell, status, ts])
                 f.flush()
                 stats[status] += 1
                 blocks = blocks + 1 if status in BLOCK_STATUSES else 0
